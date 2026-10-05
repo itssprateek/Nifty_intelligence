@@ -1,4 +1,4 @@
-"""Audit existing daily/5m NIFTY files locally. No downloads or price filling."""
+"""Audit existing daily/1m/5m NIFTY files locally. No downloads or price filling."""
 from __future__ import annotations
 import argparse
 import json
@@ -16,12 +16,14 @@ SOURCES = ['https://nsearchives.nseindia.com/content/circulars/CMTR71775.pdf',
            'https://www.nseindia.com/static/market-data/market-timings']
 PRICE = ['open', 'high', 'low', 'close']
 TZ = 'Asia/Kolkata'
+INTERVAL_MINUTES = {'1m': 1, '5m': 5}
 
 
 def grid(day, interval):
     if interval == 'daily':
         return pd.DatetimeIndex([pd.Timestamp(day, tz=TZ)])
-    return pd.date_range(day+' 09:15', day+' 15:25', freq='5min', tz=TZ)
+    minutes = INTERVAL_MINUTES[interval]
+    return pd.date_range(day+' 09:15', day+' 15:30', freq=f'{minutes}min', tz=TZ, inclusive='left')
 
 
 def audit(raw, interval):
@@ -33,9 +35,14 @@ def audit(raw, interval):
         raise ValueError('Missing timestamps must be resolved first.')
     if not set(PRICE).issubset(raw.columns):
         raise ValueError('Missing OHLC columns.')
+    if interval not in ('daily', '1m', '5m'):
+        raise ValueError(f'Unsupported interval: {interval}')
     df = raw.copy().sort_index()
     df.index = df.index.tz_convert(TZ)
     df.index.name = 'timestamp'
+    audit_start = max(START, df.index.min().strftime('%Y-%m-%d'))
+    # The end remains the calendar cutoff: detect absent trailing sessions too.
+    audit_end = END
     prices = df[PRICE].apply(pd.to_numeric, errors='coerce')
     bad = (~np.isfinite(prices.to_numpy()).all(axis=1) | prices.le(0).any(axis=1)
            | (prices.high < prices.max(axis=1)) | (prices.low > prices.min(axis=1)))
@@ -46,7 +53,7 @@ def audit(raw, interval):
     df['duplicate_timestamp'] = duplicates
     df['flat_candle'] = prices.nunique(axis=1).eq(1).to_numpy() & ~np.asarray(bad)
     # This is a review flag, not proof of a stale quote. Do not automatically delete it.
-    adjacent = pd.Series(df.index).diff().eq(pd.Timedelta(minutes=5)).to_numpy()
+    adjacent = pd.Series(df.index).diff().eq(pd.Timedelta(minutes=INTERVAL_MINUTES.get(interval, 1440))).to_numpy()
     same_prices = prices.eq(prices.shift()).all(axis=1).to_numpy()
     repeated = df.flat_candle.to_numpy() & df.flat_candle.shift(fill_value=False).to_numpy() & same_prices & adjacent
     repeated_pair = repeated | np.r_[repeated[1:], False]
@@ -57,7 +64,7 @@ def audit(raw, interval):
     df['on_expected_grid'] = False
     df['session_complete'] = False
     records, gaps = [], []
-    for dt in pd.date_range(START, END, freq='D'):
+    for dt in pd.date_range(audit_start, audit_end, freq='D'):
         day = dt.strftime('%Y-%m-%d')
         mask = dates == day
         part = df.loc[mask]
@@ -89,7 +96,7 @@ def audit(raw, interval):
     df['eligible_full_session'] = (df.session_complete & df.calendar_status.eq('scheduled')
                                    & ~df.session_review_required & ~df.invalid_ohlc & ~df.duplicate_timestamp)
     # Each block contains consecutive valid intraday bars only; never bridge sessions/gaps.
-    if interval == '5m':
+    if interval in INTERVAL_MINUTES:
         usable = (~df.invalid_ohlc & ~df.duplicate_timestamp & df.on_expected_grid
                   & df.calendar_status.eq('scheduled') & ~df.repeated_flat_review)
         breaks = (~adjacent | df.session_date.ne(df.session_date.shift()).to_numpy()
@@ -97,10 +104,11 @@ def audit(raw, interval):
         df['continuous_block_id'] = pd.Series(np.cumsum(breaks), index=df.index).where(usable).astype('Int64')
     else:
         df['continuous_block_id'] = pd.Series(pd.NA, index=df.index, dtype='Int64')
-    sessions = pd.DataFrame(records)
+    sessions = pd.DataFrame(records, columns=['date', 'status', 'expected', 'observed_valid', 'missing', 'unexpected_rows', 'flat_review_rows'])
     gap_table = pd.DataFrame(gaps, columns=['date', 'timestamp', 'reason'])
     summary = {
-        'interval': interval, 'input_rows': len(df), 'calendar_start': START, 'calendar_end': END,
+        'interval': interval, 'input_rows': len(df), 'calendar_start': audit_start, 'calendar_end': audit_end,
+        'calendar_audit_applied': audit_start <= audit_end,
         'calendar_scope': 'Weekdays except listed NSE holidays in the bounded window; no automatic future calendar updates.',
         'sources': SOURCES, 'invalid_ohlc_rows': int(df.invalid_ohlc.sum()),
         'duplicate_rows': int(df.duplicate_timestamp.sum()),
@@ -130,10 +138,11 @@ def atomic(path, writer):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--root', type=Path, default=ROOT)
+    p.add_argument('--intervals', nargs='+', choices=['daily', '1m', '5m'], default=['daily', '1m', '5m'])
     args = p.parse_args()
     root = args.root.expanduser().resolve()
     failures = 0
-    for interval in ['daily', '5m']:
+    for interval in dict.fromkeys(args.intervals):
         source = root / 'data/raw/historical' / interval / 'nifty50.parquet'
         if not source.exists():
             print(f'{interval}: input missing: {source}'); failures += 1; continue
@@ -149,7 +158,7 @@ def main():
             atomic(report/'flagged_candles.csv', lambda f: flags.to_csv(f))
             atomic(report/'summary.json', lambda f: f.write_text(json.dumps(summary, indent=2)+'\n'))
             print(f'\n=== {interval}: QUALITY REPORT ===')
-            print(f"Rows: {len(data):,} | Calendar audit: {START} to {END}")
+            print(f"Rows: {len(data):,} | Calendar audit: {summary['calendar_start']} to {summary['calendar_end']}")
             print(f"Complete sessions: {summary['complete_sessions']} | Incomplete/absent: {summary['incomplete_or_absent_sessions']}")
             print(f"Missing candles: {len(gaps)} | Repeated-flat review rows: {summary['repeated_flat_review_rows']}")
             print(f"Eligible full sessions after review flags: {summary['eligible_full_sessions']}")
