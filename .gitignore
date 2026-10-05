@@ -1,0 +1,24 @@
+
+# Python environment and cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local datasets and generated outputs
+data/
+logs/
+reports/
+
+# Credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local/editor files
+.DS_Store
+.ipynb_checkpoints/
+src/ingestion/historical/download_nifty.before-fix.py
